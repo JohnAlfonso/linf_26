@@ -30,7 +30,7 @@ MINER_EXTRA_ARGS="${MINER_EXTRA_ARGS:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
 MINER_PORT="${MINER_PORT:-9000}"
-
+MINER_EXTERNAL_PORT="${MINER_EXTERNAL_PORT:-$MINER_PORT}"
 if [[ -z "$WALLET_NAME" || -z "$WALLET_HOTKEY" ]]; then
   echo "WALLET_NAME and WALLET_HOTKEY must be set in $ENV_FILE"
   exit 1
@@ -59,6 +59,7 @@ if [[ "${1:-}" == "--foreground" ]]; then
     --wallet.name "$WALLET_NAME" \
     --wallet.hotkey "$WALLET_HOTKEY" \
     --axon.port "$MINER_PORT" \
+    --axon.external_port "${MINER_EXTERNAL_PORT:-$MINER_PORT}" \
     --log-level "$LOG_LEVEL"
   exit 0
 fi
@@ -75,6 +76,7 @@ pm2 start ".venv/bin/python" --name perturb-miner -- \
   --wallet.name "$WALLET_NAME" \
   --wallet.hotkey "$WALLET_HOTKEY" \
   --axon.port "$MINER_PORT" \
+  --axon.external_port "${MINER_EXTERNAL_PORT:-$MINER_PORT}" \
   --log-level "$LOG_LEVEL"
 pm2 save
 pm2 status perturb-miner

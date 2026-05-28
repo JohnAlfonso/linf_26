@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: perturb-subnet
+Version: 0.1.0
+Summary: Perturb Bittensor subnet (adversarial image attacks)
+Requires-Dist: bittensor>=8.0.0
+Requires-Dist: torch>=2.2.0
+Requires-Dist: torchvision>=0.17.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: pillow>=10.0.0
+Requires-Dist: requests>=2.31.0
+Requires-Dist: fastapi>=0.111.0
+Requires-Dist: uvicorn>=0.30.0
+Requires-Dist: wandb
+Dynamic: requires-dist
+Dynamic: summary
