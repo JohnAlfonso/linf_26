@@ -4,6 +4,7 @@ __pycache__/
 .DS_Store
 *.npz
 logs/
+received/
 scripts/miner.env
 scripts/validator.env
 scripts/verifier.env

@@ -251,6 +251,10 @@ def _run_pipeline(req: PerturbRequest) -> PerturbResponse:
         # (= global − 1 s). Tried B=3 N=140 — the iteration drop hurt hard
         # images more than the extra target row helped; B=2 N=180 is the
         # sweet spot empirically.
+        # NOTE: tried attack_adaptive here — failed catastrophically in
+        # production (73% deadline-skip, single 104s run) because adaptive's
+        # internal σ-zero restarts + JSMA + Sparse-RS don't respect the
+        # deadline parameter. Reverted to plain σ-zero.
         {"method": "sigma_zero", "magnitude": 1.0 / 255.0,
          "n_iterations": 180, "n_restarts": 1,
          "num_targets": 2, "n_iterations_targeted": 100,
@@ -293,6 +297,10 @@ def _run_pipeline(req: PerturbRequest) -> PerturbResponse:
                 target_idx=target_index,
                 device=device,
                 magnitude=tier["magnitude"],
+                n_restarts=tier.get("n_restarts", 4),
+                n_iterations=tier.get("n_iterations", 200),
+                shrink_rounds=tier.get("shrink_rounds", 3),
+                sparse_rs_queries=tier.get("sparse_rs_queries", 400),
             )
         if tier["method"] == "trivial_top_k":
             return attack_trivial_top_k_pixels(

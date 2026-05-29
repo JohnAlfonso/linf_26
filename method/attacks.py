@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, Optional
 
 import torch
 import torch.nn.functional as F
@@ -617,6 +618,7 @@ def attack_jsma_greedy(
     backward_eliminate: bool = True,
     cluster_kernel: int = 1,
     n_batches_cap: int = 250,
+    deadline: Optional[float] = None,
 ) -> Iterator[torch.Tensor]:
     """JSMA-style greedy pixel growth across multiple runner-up classes.
 
@@ -661,11 +663,15 @@ def attack_jsma_greedy(
     yielded_any = False
     last_delta = torch.zeros_like(clean)
     for runner_up in runner_ups:
+        if deadline is not None and time.time() >= deadline:
+            break
         delta = torch.zeros_like(clean)
         used = torch.zeros(total, dtype=torch.bool, device=clean.device)
         flipped_at = -1
 
         for batch_i in range(n_batches):
+            if deadline is not None and batch_i % 4 == 0 and time.time() >= deadline:
+                break
             x_curr = (clean + delta).clamp(0.0, 1.0)
             grad = _margin_grad_at(
                 model=model, x=x_curr, true_idx=target_idx, runner_up_idx=runner_up,
@@ -1026,6 +1032,7 @@ def _sparse_rs_run(
     seed_delta: torch.Tensor,
     rng_seed: int = 0,
     max_swap: int = 3,
+    deadline: Optional[float] = None,
 ) -> tuple[torch.Tensor | None, int]:
     """Gradient-free random local search (Sparse-RS style) for a sparse
     ±magnitude flip, seeded from `seed_delta` (the quantized σ-zero near-miss).
@@ -1070,7 +1077,9 @@ def _sparse_rs_run(
     if cur_margin < 0.0:
         _record(cur_adv)
 
-    for _ in range(int(n_queries)):
+    for _q in range(int(n_queries)):
+        if deadline is not None and _q % 16 == 0 and time.time() >= deadline:
+            break
         cand = delta.clone()
         active = (cand != 0).nonzero(as_tuple=False).view(-1)
         inactive = (cand == 0).nonzero(as_tuple=False).view(-1)
@@ -1120,6 +1129,115 @@ def _sparse_rs_run(
                 _record(cand_adv)
 
     return best_adv, best_k
+
+
+def attack_square_linf(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    magnitude: float = 1.0 / 255.0,
+    n_queries: int = 200,
+    p_init: float = 0.005,
+    h_min: int = 2,
+    rng_seed: int = 0,
+    deadline: Optional[float] = None,
+) -> tuple[torch.Tensor, float, int]:
+    """Two-phase Square Attack adapted for the sparse-low-K scoring
+    objective. Phase 1: grow patches to flip. Phase 2 (post-flip):
+    try ZEROING existing patches while preserving the flip → drives K
+    down. Classical Square Attack only does phase 1 and ignores K.
+
+    Gradient-free (forward passes only). Adds algorithmic diversity vs
+    sigma_a/sigma_b/jsma (all gradient-based).
+
+    Returns (best_adv, best_margin, best_k). `best_adv` is the LOWEST-K
+    flipping candidate when one was found, else the lowest-margin
+    non-flipping candidate (useful as a boost starting point).
+    """
+    C, H, W = clean.shape
+    n_queries = max(1, int(n_queries))
+    h_init = max(int(h_min), int(round(math.sqrt(p_init * H * W))))
+
+    gen = torch.Generator(device=clean.device).manual_seed(int(rng_seed))
+
+    @torch.no_grad()
+    def _margin(adv: torch.Tensor) -> float:
+        lg = logits_for_images(model=model, image_bchw=adv.unsqueeze(0))[0]
+        masked = lg.clone()
+        masked[target_idx] = float("-inf")
+        return float((lg[target_idx] - masked.max()).item())
+
+    delta = torch.zeros_like(clean)
+    cur_adv = clean.clone()
+    cur_margin = _margin(cur_adv)
+
+    # Track the best result: prefer the smallest-K flipping candidate;
+    # if nothing ever flipped, the lowest-margin non-flipping candidate.
+    best_flip_adv: Optional[torch.Tensor] = None
+    best_flip_k = clean.numel() + 1
+    best_pre_flip_adv = cur_adv.clone()
+    best_pre_flip_margin = cur_margin
+
+    def _delta_k(d: torch.Tensor) -> int:
+        return int(d.abs().gt(1e-9).sum().item())
+
+    for q in range(n_queries):
+        if deadline is not None and q % 8 == 0 and time.time() >= deadline:
+            break
+
+        # Square patch size: shrink as we progress.
+        frac = q / max(1, n_queries - 1)
+        h = max(h_min, int(round(h_init * (1.0 - 0.85 * frac))))
+        if h > H:
+            h = H
+        if h > W:
+            h = W
+        i = int(torch.randint(0, H - h + 1, (1,), generator=gen, device=clean.device).item())
+        j = int(torch.randint(0, W - h + 1, (1,), generator=gen, device=clean.device).item())
+
+        trial_delta = delta.clone()
+        if cur_margin >= 0.0:
+            # Phase 1: not flipped — add a random ±magnitude patch.
+            signs = torch.randint(
+                0, 2, (C, 1, 1), generator=gen, device=clean.device,
+            ).to(clean.dtype) * 2.0 - 1.0
+            trial_delta[:, i:i + h, j:j + h] = signs * magnitude
+        else:
+            # Phase 2: flipped — try to ZERO a patch (shrink K) while
+            # preserving the flip.
+            trial_delta[:, i:i + h, j:j + h] = 0.0
+
+        trial_adv = (clean + trial_delta).clamp(0.0, 1.0)
+        new_margin = _margin(trial_adv)
+
+        # Acceptance criterion depends on phase:
+        if cur_margin >= 0.0:
+            # Not flipped: accept any margin reduction.
+            accept = new_margin < cur_margin
+        else:
+            # Flipped: only accept if we stay flipped (new_margin < 0).
+            # Doesn't matter if new_margin is slightly higher (less negative),
+            # as long as it stays below 0 — we're trading margin for K.
+            accept = new_margin < 0.0
+
+        if accept:
+            delta = trial_adv - clean
+            cur_adv = trial_adv
+            cur_margin = new_margin
+            if new_margin < 0.0:
+                k_now = _delta_k(delta)
+                if k_now < best_flip_k:
+                    best_flip_k = k_now
+                    best_flip_adv = trial_adv.detach().clone()
+            else:
+                if new_margin < best_pre_flip_margin:
+                    best_pre_flip_margin = new_margin
+                    best_pre_flip_adv = trial_adv.detach().clone()
+
+    if best_flip_adv is not None:
+        return best_flip_adv, -1.0, best_flip_k
+    best_k = _delta_k(best_pre_flip_adv - clean)
+    return best_pre_flip_adv, best_pre_flip_margin, best_k
 
 
 def _boost_margin_on_mask(
@@ -1356,6 +1474,7 @@ def attack_sigma_zero(
         for rup in list(runner_ups)[1:]:
             targets.append(int(rup))
         B = len(targets)
+        B = len(targets)
         init_u_batch = torch.zeros((B, d), device=device)
         adv_b, _k = _sigma_zero_batched(
             model=model, clean=clean, target_idx=target_idx,
@@ -1429,7 +1548,7 @@ def attack_sigma_zero(
                     init_u=torch.zeros(d, device=device),
                     targeted_idx=int(rup),
                     deadline=deadline,
-                )
+                    )
                 if adv_t is not None:
                     candidates.append(adv_t)
 
