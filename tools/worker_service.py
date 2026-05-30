@@ -348,12 +348,164 @@ def _strategy_sparse_rs(
     return (clean + seed_delta).clamp(0.0, 1.0)
 
 
+def _strategy_sigma_c(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """σ-zero zeros-init, B=8 batched (1 untargeted + 7 targeted at top
+    runner-ups). Largest batch = most parallel Pareto-K candidates per
+    forward pass — better K convergence. Designed for GPU2 (RTX PRO 6000)
+    which has the VRAM headroom for B=8.
+
+    Diversity: vs sigma_a (B=2), this samples 4× more target classes per
+    iteration → finds optimal target much faster on hard images."""
+    runner_ups = _top_runner_ups(
+        model=model, clean=clean, true_idx=target_idx, n=8,
+    )
+    targets: list[int | None] = [None]
+    for rup in runner_ups[1:8]:
+        targets.append(int(rup))
+    B = len(targets)
+    d = clean.numel()
+    init_u_batch = torch.zeros((B, d), device=device)
+    adv_b, _k = _sigma_zero_batched(
+        model=model, clean=clean, target_idx=target_idx,
+        magnitude=1.0 / 255.0, n_iterations=200,
+        init_u_batch=init_u_batch,
+        targeted_idx_batch=targets,
+        deadline=deadline,
+    )
+    return adv_b if adv_b is not None else clean.clone()
+
+
+def _strategy_sigma_d(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """σ-zero random-init, B=4, RNG seed=17. Different basin from
+    sigma_b (seed=1) — increases probability of finding a low-K
+    solution on hard images via stochastic restart."""
+    runner_ups = _top_runner_ups(
+        model=model, clean=clean, true_idx=target_idx, n=4,
+    )
+    targets: list[int | None] = [None]
+    for rup in runner_ups[1:4]:
+        targets.append(int(rup))
+    B = len(targets)
+    d = clean.numel()
+    gen = torch.Generator(device=device).manual_seed(17)
+    init_u_batch = (
+        (torch.rand((B, d), generator=gen, device=device) * 2.0 - 1.0) * 0.5
+    )
+    adv_b, _k = _sigma_zero_batched(
+        model=model, clean=clean, target_idx=target_idx,
+        magnitude=1.0 / 255.0, n_iterations=240,
+        init_u_batch=init_u_batch,
+        targeted_idx_batch=targets,
+        deadline=deadline,
+    )
+    return adv_b if adv_b is not None else clean.clone()
+
+
+def _strategy_sigma_e(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """σ-zero random-init, B=4, RNG seed=42. Third restart basin —
+    completes a Markov-style multi-restart cluster (seeds 1, 17, 42)
+    across sigma_b, sigma_d, sigma_e. Coordinator picks the lowest-K
+    result from all three."""
+    runner_ups = _top_runner_ups(
+        model=model, clean=clean, true_idx=target_idx, n=4,
+    )
+    targets: list[int | None] = [None]
+    for rup in runner_ups[1:4]:
+        targets.append(int(rup))
+    B = len(targets)
+    d = clean.numel()
+    gen = torch.Generator(device=device).manual_seed(42)
+    init_u_batch = (
+        (torch.rand((B, d), generator=gen, device=device) * 2.0 - 1.0) * 0.5
+    )
+    adv_b, _k = _sigma_zero_batched(
+        model=model, clean=clean, target_idx=target_idx,
+        magnitude=1.0 / 255.0, n_iterations=240,
+        init_u_batch=init_u_batch,
+        targeted_idx_batch=targets,
+        deadline=deadline,
+    )
+    return adv_b if adv_b is not None else clean.clone()
+
+
+def _strategy_sparse_rs_v2(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """Sparse-RS warmstart with RNG seed=99 (vs sparse_rs's seed=7).
+    Same algorithm as sparse_rs but different random trajectory →
+    different (K, margin) tradeoff on a given image. Together with
+    sparse_rs, this acts as a 2-restart Sparse-RS ensemble."""
+    t_start = time.time()
+    seed_deadline = t_start + min(3.5, (deadline - t_start) * 0.35)
+    runner_ups = _top_runner_ups(model=model, clean=clean, true_idx=target_idx, n=1)
+    targets: list[int | None] = [None]
+    d = clean.numel()
+    init_u_batch = torch.zeros((1, d), device=device)
+    try:
+        seed_adv, _k = _sigma_zero_batched(
+            model=model, clean=clean, target_idx=target_idx,
+            magnitude=1.0 / 255.0, n_iterations=80,
+            init_u_batch=init_u_batch,
+            targeted_idx_batch=targets,
+            deadline=seed_deadline,
+        )
+    except Exception as exc:
+        logger.warning(f"sparse_rs_v2 seed phase (σ-zero) failed: {exc}")
+        seed_adv = None
+    if seed_adv is None:
+        seed_delta = torch.zeros_like(clean)
+    else:
+        seed_delta = (seed_adv - clean).detach()
+    try:
+        rs_adv, _rs_k = _sparse_rs_run(
+            model=model, clean=clean, target_idx=target_idx,
+            magnitude=1.0 / 255.0,
+            n_queries=300,
+            seed_delta=seed_delta,
+            rng_seed=99,   # different from sparse_rs's seed=7
+            max_swap=3,
+            deadline=deadline,
+        )
+        if rs_adv is not None:
+            return rs_adv
+    except Exception as exc:
+        logger.warning(f"sparse_rs_v2 refinement failed: {exc}")
+    return (clean + seed_delta).clamp(0.0, 1.0)
+
+
 _STRATEGIES = {
     "sigma_a": _strategy_sigma_a,
     "sigma_b": _strategy_sigma_b,
     "jsma": _strategy_jsma,
     "square": _strategy_square,
     "sparse_rs": _strategy_sparse_rs,
+    # New strategies for GPU2 (workers 5-8):
+    "sigma_c": _strategy_sigma_c,
+    "sigma_d": _strategy_sigma_d,
+    "sigma_e": _strategy_sigma_e,
+    "sparse_rs_v2": _strategy_sparse_rs_v2,
 }
 
 
