@@ -19,4 +19,5 @@ tools/__init__.py
 tools/label_matcher_service.py
 tools/llm_endpoint_service.py
 tools/perturb_pipeline_service.py
+tools/uap_generate.py
 tools/worker_service.py

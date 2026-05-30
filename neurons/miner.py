@@ -114,6 +114,11 @@ MINER_HARD_TIMEOUT_S = float(os.getenv("PERTURB_MINER_HARD_TIMEOUT_S", "14.0"))
 # Empty (default) → fall back to local single-GPU pipeline.
 _WORKER_URLS_RAW = os.getenv("PERTURB_WORKER_URLS", "").strip()
 WORKER_URLS: list[str] = [u.strip() for u in _WORKER_URLS_RAW.split(",") if u.strip()]
+# Hard-image-only workers: only dispatched when phase_e gap > 3 (hard image).
+# Saves their compute on easy cases. Typically deployed on a dedicated GPU
+# (e.g., GPU3 RTX 3090) with specialized hard-image strategies.
+_HARD_WORKER_URLS_RAW = os.getenv("PERTURB_HARD_WORKER_URLS", "").strip()
+HARD_WORKER_URLS: list[str] = [u.strip() for u in _HARD_WORKER_URLS_RAW.split(",") if u.strip()]
 # Per-worker request timeout. Should be larger than the worker's own
 # attack deadline (default 9s on the worker side) to leave room for
 # network roundtrip. 11s = 9s worker + 2s network overhead.
@@ -584,6 +589,7 @@ class PerturbMiner:
         true_label: str,
         epsilon: float,
         hard_deadline: float,
+        is_hard_image: bool = False,
     ) -> typing.Optional[typing.Any]:
         """Distributed-mode: send the challenge to N worker servers in
         parallel, gather their adversarials, score each via FP32-strict
@@ -610,8 +616,12 @@ class PerturbMiner:
             return None
 
         # Worker deadline = wall budget minus boost+ship reserve.
-        # Boost typically takes ~1s; encode+ship typically <0.5s.
-        worker_deadline_s = max(2.0, hard_deadline - time.time() - 2.5)
+        # On HARD images (phase_e gap > 3), give boost more time by cutting
+        # worker time. Hard images need more boost iterations to climb out
+        # of the negative-margin valley; workers already plateau by 7s on
+        # hard cases anyway.
+        reserve_s = 4.5 if is_hard_image else 2.5
+        worker_deadline_s = max(2.0, hard_deadline - time.time() - reserve_s)
         payload = {
             "clean_image_b64": synapse.clean_image_b64,
             "true_label": synapse.true_label or "",
@@ -634,9 +644,17 @@ class PerturbMiner:
                 logger.warning(f"worker {url} failed: {exc}")
                 return None
 
+        # Dispatch list: always-on WORKER_URLS plus HARD_WORKER_URLS only
+        # when this is a hard image (gap > 3). Hard workers run extended
+        # iterations / aggressive K-reduction that's only worth the GPU
+        # cost when σ-zero is expected to struggle.
+        dispatch_urls = list(WORKER_URLS)
+        if is_hard_image and HARD_WORKER_URLS:
+            dispatch_urls.extend(HARD_WORKER_URLS)
+
         t_dispatch = time.time()
         try:
-            results = await asyncio.gather(*[_call_worker(u) for u in WORKER_URLS])
+            results = await asyncio.gather(*[_call_worker(u) for u in dispatch_urls])
         except Exception as exc:
             logger.warning(f"asyncio.gather failed: {exc}")
             return None
@@ -645,7 +663,7 @@ class PerturbMiner:
         candidates = [r for r in results if r is not None]
         if not candidates:
             logger.warning(
-                f"all {len(WORKER_URLS)} workers failed in {dispatch_ms}ms; "
+                f"all {len(dispatch_urls)} workers failed in {dispatch_ms}ms; "
                 f"falling back to local pipeline"
             )
             return None
@@ -713,8 +731,9 @@ class PerturbMiner:
             return None
 
         logger.info(
-            f"workers: {len(candidates)}/{len(WORKER_URLS)} ok, "
-            f"scored={scored_count}, best_strategy={best_strategy}, "
+            f"workers: {len(candidates)}/{len(dispatch_urls)} ok "
+            f"(hard={is_hard_image}), scored={scored_count}, "
+            f"best_strategy={best_strategy}, "
             f"best_score={best_score:.4f}, dispatch={dispatch_ms}ms"
         )
 
@@ -847,6 +866,7 @@ class PerturbMiner:
                 # Only when we have a validator-supplied true_label —
                 # otherwise we don't know which class to measure gap to.
                 if desired_target_idx is not None:
+                    gap = 0.0
                     try:
                         clean_for_gap = decode_image_b64(
                             synapse.clean_image_b64
@@ -860,6 +880,13 @@ class PerturbMiner:
                     except Exception as exc:
                         logger.warning(f"phase_e gap computation failed: {exc}")
                         _PER_REQUEST_SIGMA.clear()
+
+                # Hard-image detection: validator stats show our min_score
+                # (0.9036) is what drops avg, vs top miner min (0.9299).
+                # On gap > 3 images, σ-zero workers plateau early and the
+                # bottleneck is boost time. Reallocate budget: less worker
+                # time, more boost time on hard images.
+                is_hard_image = gap > 3.0
 
                 # Distributed multi-GPU path. If WORKER_URLS is set, send
                 # the request to N worker servers in parallel, score
@@ -875,6 +902,7 @@ class PerturbMiner:
                             true_label=true_label,
                             epsilon=float(synapse.epsilon),
                             hard_deadline=hard_deadline,
+                            is_hard_image=is_hard_image,
                         )
                         if worker_resp is not None:
                             resp = worker_resp
@@ -966,13 +994,19 @@ class PerturbMiner:
                 # GPU via the shared model. Pass the hard deadline so
                 # each step bails before we'd cross the validator's 15s
                 # timeout. Reserve 0.3s for encode + return.
+                # On HARD images, boost typically hits its K cap with
+                # margin still negative; raise the cap so it has room
+                # to grow further (we already gave it more time via
+                # reduced worker reserve).
                 if desired_target_idx is not None:
+                    topk_cap_override = 640 if is_hard_image else None
                     boosted_b64, margin_info = self._boost_margin_if_low(
                         adv_b64=pipeline_b64_for_boost,
                         clean_b64=synapse.clean_image_b64,
                         true_idx=desired_target_idx,
                         epsilon=float(synapse.epsilon),
                         deadline=hard_deadline - 0.3,
+                        topk_cap_override=topk_cap_override,
                     )
                     synapse.perturbed_image_b64 = boosted_b64
                 else:
@@ -1154,6 +1188,7 @@ class PerturbMiner:
         true_idx: int,
         epsilon: float,
         deadline: float | None = None,
+        topk_cap_override: int | None = None,
     ) -> typing.Tuple[str, str]:
         """If the pipeline's adversarial sits within `MIN_MARGIN_LOGITS` of
         the decision boundary, push it past via short margin-descent PGD
@@ -1243,7 +1278,8 @@ class PerturbMiner:
             return adv_b64, f"{margin:.3f}(eps_too_small)"
 
         # Phase D: adaptive top-K starts low and grows toward the cap.
-        topk_cap = max(1, min(MARGIN_BOOST_TOPK_PIXELS, adv.numel()))
+        topk_cap_base = topk_cap_override if topk_cap_override is not None else MARGIN_BOOST_TOPK_PIXELS
+        topk_cap = max(1, min(topk_cap_base, adv.numel()))
         topk = max(1, min(MARGIN_BOOST_TOPK_INITIAL, topk_cap))
         clean_flat = clean.view(-1)
         # SAFETY: track the best-flipping candidate we've seen during the

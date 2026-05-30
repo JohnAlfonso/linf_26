@@ -495,6 +495,103 @@ def _strategy_sparse_rs_v2(
     return (clean + seed_delta).clamp(0.0, 1.0)
 
 
+def _strategy_sigma_hard_a(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """σ-zero zeros-init, B=4, n_iter=500 — EXTENDED iterations for hard
+    images where standard 240-300 iterations plateau early. Only dispatched
+    when coordinator detects gap > 3 (hard image), so extra time is fine."""
+    runner_ups = _top_runner_ups(
+        model=model, clean=clean, true_idx=target_idx, n=4,
+    )
+    targets: list[int | None] = [None]
+    for rup in runner_ups[1:4]:
+        targets.append(int(rup))
+    B = len(targets)
+    d = clean.numel()
+    init_u_batch = torch.zeros((B, d), device=device)
+    adv_b, _k = _sigma_zero_batched(
+        model=model, clean=clean, target_idx=target_idx,
+        magnitude=1.0 / 255.0, n_iterations=500,
+        init_u_batch=init_u_batch,
+        targeted_idx_batch=targets,
+        deadline=deadline,
+    )
+    return adv_b if adv_b is not None else clean.clone()
+
+
+def _strategy_sigma_hard_b(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """σ-zero random-init B=4, RNG seed=99, n_iter=400 — additional basin
+    for hard-image multi-restart. Together with sigma_b (seed=1), sigma_d
+    (seed=17), sigma_e (seed=42), this adds a 4th independent restart."""
+    runner_ups = _top_runner_ups(
+        model=model, clean=clean, true_idx=target_idx, n=4,
+    )
+    targets: list[int | None] = [None]
+    for rup in runner_ups[1:4]:
+        targets.append(int(rup))
+    B = len(targets)
+    d = clean.numel()
+    gen = torch.Generator(device=device).manual_seed(99)
+    init_u_batch = (
+        (torch.rand((B, d), generator=gen, device=device) * 2.0 - 1.0) * 0.5
+    )
+    adv_b, _k = _sigma_zero_batched(
+        model=model, clean=clean, target_idx=target_idx,
+        magnitude=1.0 / 255.0, n_iterations=400,
+        init_u_batch=init_u_batch,
+        targeted_idx_batch=targets,
+        deadline=deadline,
+    )
+    return adv_b if adv_b is not None else clean.clone()
+
+
+def _strategy_jsma_strong(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """JSMA with backward_eliminate=True — produces LOW K (~300) but slow
+    (~15-25s under MPS). Only viable for hard-image-only deployment where
+    we have full deadline budget and don't compete with other workers.
+
+    backward_eliminate runs O(K) per-pixel removal pass which drops K
+    from JSMA's typical 2,187 to ~300 — directly competitive with σ-zero
+    on K count, with a different algorithm family.
+    """
+    last_adv = clean.clone()
+    try:
+        for adv in attack_jsma_greedy(
+            model=model, clean=clean, target_idx=target_idx, device=device,
+            magnitude=1.0 / 255.0,
+            batch_pixels=16, max_k_fraction=0.05,
+            num_runner_ups=3,
+            backward_eliminate=True,  # KEY: enable K-reduction
+            cluster_kernel=3,
+            yield_after_flip_batches=2,
+            n_batches_cap=50,
+            deadline=deadline,
+        ):
+            last_adv = adv
+            if time.time() >= deadline:
+                break
+    except Exception as exc:
+        logger.warning(f"jsma_strong failed: {exc}")
+    return last_adv
+
+
 _STRATEGIES = {
     "sigma_a": _strategy_sigma_a,
     "sigma_b": _strategy_sigma_b,
@@ -506,6 +603,10 @@ _STRATEGIES = {
     "sigma_d": _strategy_sigma_d,
     "sigma_e": _strategy_sigma_e,
     "sparse_rs_v2": _strategy_sparse_rs_v2,
+    # New strategies for GPU3 (workers 9-11) — hard-image-only:
+    "sigma_hard_a": _strategy_sigma_hard_a,
+    "sigma_hard_b": _strategy_sigma_hard_b,
+    "jsma_strong": _strategy_jsma_strong,
 }
 
 
