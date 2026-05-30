@@ -502,21 +502,22 @@ def _strategy_sigma_hard_a(
     device: torch.device,
     deadline: float,
 ) -> torch.Tensor:
-    """σ-zero zeros-init, B=4, n_iter=500 — EXTENDED iterations for hard
-    images where standard 240-300 iterations plateau early. Only dispatched
-    when coordinator detects gap > 3 (hard image), so extra time is fine."""
+    """σ-zero zeros-init, B=8, n_iter=400 — large batch + extended iters,
+    designed for the RTX PRO 6000 (96GB) on GPU3. 8 parallel target classes
+    per pass = best Pareto-K coverage. Only dispatched on hard images so the
+    longer compute is justified."""
     runner_ups = _top_runner_ups(
-        model=model, clean=clean, true_idx=target_idx, n=4,
+        model=model, clean=clean, true_idx=target_idx, n=8,
     )
     targets: list[int | None] = [None]
-    for rup in runner_ups[1:4]:
+    for rup in runner_ups[1:8]:
         targets.append(int(rup))
     B = len(targets)
     d = clean.numel()
     init_u_batch = torch.zeros((B, d), device=device)
     adv_b, _k = _sigma_zero_batched(
         model=model, clean=clean, target_idx=target_idx,
-        magnitude=1.0 / 255.0, n_iterations=500,
+        magnitude=1.0 / 255.0, n_iterations=400,
         init_u_batch=init_u_batch,
         targeted_idx_batch=targets,
         deadline=deadline,
@@ -531,14 +532,14 @@ def _strategy_sigma_hard_b(
     device: torch.device,
     deadline: float,
 ) -> torch.Tensor:
-    """σ-zero random-init B=4, RNG seed=99, n_iter=400 — additional basin
-    for hard-image multi-restart. Together with sigma_b (seed=1), sigma_d
-    (seed=17), sigma_e (seed=42), this adds a 4th independent restart."""
+    """σ-zero random-init B=8, RNG seed=99, n_iter=400 — upgraded to B=8
+    for RTX PRO 6000. Additional restart basin with full 8-target Pareto.
+    Together with sigma_b/d/e, completes a 4-seed × multi-batch ensemble."""
     runner_ups = _top_runner_ups(
-        model=model, clean=clean, true_idx=target_idx, n=4,
+        model=model, clean=clean, true_idx=target_idx, n=8,
     )
     targets: list[int | None] = [None]
-    for rup in runner_ups[1:4]:
+    for rup in runner_ups[1:8]:
         targets.append(int(rup))
     B = len(targets)
     d = clean.numel()
@@ -549,6 +550,37 @@ def _strategy_sigma_hard_b(
     adv_b, _k = _sigma_zero_batched(
         model=model, clean=clean, target_idx=target_idx,
         magnitude=1.0 / 255.0, n_iterations=400,
+        init_u_batch=init_u_batch,
+        targeted_idx_batch=targets,
+        deadline=deadline,
+    )
+    return adv_b if adv_b is not None else clean.clone()
+
+
+def _strategy_sigma_max(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """σ-zero zeros-init, B=12 (maximum parallel targets), n_iter=300.
+    Designed for RTX PRO 6000 (96GB) on GPU3 — uses ~24 GB VRAM alone.
+    12 simultaneous target classes is the most parallel Pareto-K coverage
+    we can run; the 'sigma_*' workers run B=2/4/8, sigma_max pushes to 12.
+    Only dispatched on hard images (gap > 3) via HARD_WORKER_URLS."""
+    runner_ups = _top_runner_ups(
+        model=model, clean=clean, true_idx=target_idx, n=12,
+    )
+    targets: list[int | None] = [None]
+    for rup in runner_ups[1:12]:
+        targets.append(int(rup))
+    B = len(targets)
+    d = clean.numel()
+    init_u_batch = torch.zeros((B, d), device=device)
+    adv_b, _k = _sigma_zero_batched(
+        model=model, clean=clean, target_idx=target_idx,
+        magnitude=1.0 / 255.0, n_iterations=300,
         init_u_batch=init_u_batch,
         targeted_idx_batch=targets,
         deadline=deadline,
@@ -603,10 +635,11 @@ _STRATEGIES = {
     "sigma_d": _strategy_sigma_d,
     "sigma_e": _strategy_sigma_e,
     "sparse_rs_v2": _strategy_sparse_rs_v2,
-    # New strategies for GPU3 (workers 9-11) — hard-image-only:
+    # New strategies for GPU3 (workers 9-12) — hard-image-only:
     "sigma_hard_a": _strategy_sigma_hard_a,
     "sigma_hard_b": _strategy_sigma_hard_b,
     "jsma_strong": _strategy_jsma_strong,
+    "sigma_max": _strategy_sigma_max,
 }
 
 

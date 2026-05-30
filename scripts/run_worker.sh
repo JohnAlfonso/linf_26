@@ -40,9 +40,9 @@ WORKER_HOST="${WORKER_HOST:-0.0.0.0}"
 
 # Validate strategy early before launching uvicorn.
 case "$WORKER_STRATEGY" in
-  sigma_a|sigma_b|sigma_c|sigma_d|sigma_e|sigma_hard_a|sigma_hard_b|jsma|jsma_strong|square|sparse_rs|sparse_rs_v2) ;;
+  sigma_a|sigma_b|sigma_c|sigma_d|sigma_e|sigma_hard_a|sigma_hard_b|sigma_max|jsma|jsma_strong|square|sparse_rs|sparse_rs_v2) ;;
   *)
-    echo "Invalid WORKER_STRATEGY=$WORKER_STRATEGY (allowed: sigma_a/b/c/d/e/hard_a/hard_b, jsma, jsma_strong, square, sparse_rs, sparse_rs_v2)"
+    echo "Invalid WORKER_STRATEGY=$WORKER_STRATEGY (allowed: sigma_a/b/c/d/e/hard_a/hard_b/max, jsma, jsma_strong, square, sparse_rs, sparse_rs_v2)"
     exit 1
     ;;
 esac

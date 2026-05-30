@@ -17,18 +17,20 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-echo "Starting GPU3 hard-image workers (3 workers on ports 9221-9223)..."
+echo "Starting GPU3 hard-image workers (4 workers on ports 9221-9224)..."
 echo ""
 
 WORKER_ENV=worker_sigma_hard_a.env bash scripts/run_worker.sh
 WORKER_ENV=worker_sigma_hard_b.env bash scripts/run_worker.sh
 WORKER_ENV=worker_jsma_strong.env  bash scripts/run_worker.sh
+WORKER_ENV=worker_sigma_max.env    bash scripts/run_worker.sh
 
 echo ""
-echo "All 3 GPU3 hard-image workers launched. Verify with:"
-echo "  curl http://localhost:9221/health  # sigma_hard_a"
-echo "  curl http://localhost:9222/health  # sigma_hard_b"
+echo "All 4 GPU3 hard-image workers launched. Verify with:"
+echo "  curl http://localhost:9221/health  # sigma_hard_a (B=8)"
+echo "  curl http://localhost:9222/health  # sigma_hard_b (B=8)"
 echo "  curl http://localhost:9223/health  # jsma_strong"
+echo "  curl http://localhost:9224/health  # sigma_max (B=12)"
 echo ""
 echo "Then on the COORDINATOR (GPU1) machine, ADD to scripts/miner.env:"
 echo "  export PERTURB_HARD_WORKER_URLS=\"\\"
