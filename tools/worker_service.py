@@ -781,6 +781,179 @@ def _strategy_sigma_max_malt(
     return adv_b if adv_b is not None else clean.clone()
 
 
+def _strategy_greedy_fool(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """GreedyFool (Dong et al., NeurIPS 2020) adapted for L∞=1/255 sparse
+    adversarial attack. Two-stage greedy: SELECT pixels to flip, REDUCE
+    by dropping least-important ones while preserving flip.
+
+    Paper-reported numbers on ImageNet ResNet: 3× lower K than SparseFool
+    (K=27 vs K=80 at full magnitude). Different algorithm family from
+    σ-zero/Sparse-RS/JSMA — should add diversity to the ensemble.
+
+    Adaptation (vs original paper):
+    - L∞=1/255 hard constraint (paper uses magnitude=255 / no constraint)
+    - No GAN-based invisibility map (we only optimize K, not perceptual)
+    - Per-pixel margin-gradient as removal-cost proxy (paper uses full
+      forward per pixel — too slow for our 9s budget; ours is gradient-
+      based linear approximation that batches removals)
+    - MALT-picked single target (paper uses untargeted runner-up)
+    """
+    magnitude = 1.0 / 255.0
+    d = clean.numel()
+
+    # Pre-stage: MALT target picking
+    targets = _malt_pick_targets(
+        model=model, clean=clean, true_idx=target_idx,
+        n_candidates=15, n_pick=1,
+    )
+    if not targets:
+        return clean.clone()
+    target_t = int(targets[0])
+
+    clean_flat = clean.view(-1)
+    adv_flat = clean_flat.clone()
+    mask = torch.zeros(d, device=device, dtype=torch.bool)
+
+    def _margin_at_flat(flat: torch.Tensor) -> tuple[float, torch.Tensor]:
+        """Returns (margin, gradient_flat). margin = logit[true] - logit[target_t]
+        (negative means flipped)."""
+        x = flat.view_as(clean).detach().requires_grad_(True)
+        lg = logits_for_images(model=model, image_bchw=x.unsqueeze(0))[0]
+        m = lg[target_idx] - lg[target_t]
+        g = torch.autograd.grad(m, x)[0].detach().view(-1)
+        return float(m.item()), g
+
+    # ── Stage 1: SELECT — grow K until PNG-roundtripped flip occurs ─────
+    K = 32
+    growth = 2
+    K_max = 1024
+    flipped = False
+
+    for _ in range(8):
+        if time.time() >= deadline:
+            break
+        _, grad = _margin_at_flat(adv_flat)
+        # Mask out already-perturbed pixels by setting |grad| to -1
+        scores = grad.abs().clone()
+        scores[mask] = -1.0
+        n_new = min(K, int(d - mask.sum().item()))
+        if n_new <= 0:
+            break
+        _, new_idx = scores.topk(n_new)
+        # ±magnitude descent step on these pixels
+        step = -magnitude * grad.sign()
+        adv_flat[new_idx] = (clean_flat[new_idx] + step[new_idx]).clamp(0.0, 1.0)
+        mask[new_idx] = True
+        # PNG-roundtripped flip check (validator's view)
+        if _predict_idx_roundtrip(model, adv_flat.view_as(clean)) != target_idx:
+            flipped = True
+            break
+        K = min(K * growth, K_max)
+
+    if not flipped:
+        # Couldn't find flip even at K_max — return clean (coordinator
+        # will skip this candidate since margin < 0).
+        return clean.clone()
+
+    # ── Stage 2: REDUCE — drop pixels while preserving flip ─────────────
+    # Approximate per-pixel "removal cost" via gradient × current delta.
+    # Removing pixel i changes margin by ≈ grad[i] * (clean[i] - adv[i]).
+    # Pixels where this is most-negative (margin decreases further, i.e.
+    # flip strengthens or stays) are safe to remove.
+    best_adv = adv_flat.clone()
+    best_k = int(mask.sum().item())
+
+    for _round in range(20):
+        if time.time() >= deadline:
+            break
+        n_perturbed = int(mask.sum().item())
+        if n_perturbed <= 4:
+            break
+        perturbed_idx = mask.nonzero(as_tuple=False).view(-1)
+        _, grad = _margin_at_flat(adv_flat)
+        delta = adv_flat - clean_flat
+        # Margin change if we REVERT pixel i (set delta[i] = 0):
+        # Δmargin ≈ grad[i] * (clean[i] - adv[i]) = grad[i] * (-delta[i])
+        # Want margin to stay negative (flip survives). Pixels where
+        # Δmargin is most negative (further decrease) are safest to drop.
+        removal_cost = grad[perturbed_idx] * (-delta[perturbed_idx])
+        _, order = removal_cost.sort()  # ascending: safest first
+
+        # Try batch removal: largest batch first, halve on failure.
+        batch = max(1, n_perturbed // 4)
+        succeeded_this_round = False
+        while batch >= 1:
+            if time.time() >= deadline:
+                break
+            cand = perturbed_idx[order[:batch]]
+            test_adv = adv_flat.clone()
+            test_adv[cand] = clean_flat[cand]
+            if _predict_idx_roundtrip(model, test_adv.view_as(clean)) != target_idx:
+                adv_flat = test_adv
+                mask[cand] = False
+                succeeded_this_round = True
+                new_k = int(mask.sum().item())
+                if new_k < best_k:
+                    best_k = new_k
+                    best_adv = adv_flat.clone()
+                break
+            batch //= 2
+
+        if not succeeded_this_round:
+            break
+
+    return best_adv.view_as(clean)
+
+
+def _strategy_sigma_grind(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """σ-zero B=1 (single MALT-picked target), n=900 — deep grind for
+    lowest possible K on easy images.
+
+    Pintor 2024 explicitly demonstrates that single-target σ-zero finds
+    lower-K solutions than multi-target setups: with B>1, the soft-L0
+    penalty has to compromise across multiple target classes that compete
+    for the same pixel budget. B=1 lets the optimizer focus all
+    descent steps on the single cheapest target, driving K below what
+    sigma_a (B=2) / sigma_max (B=12) plateau at.
+
+    Pre-stage: MALT picks the cheapest of top-20 targets (~700ms).
+    Main loop: B=1 × n=900 ≈ 8.5s on RTX PRO 6000.
+
+    Designed to attack the easy-image K gap: top miners ship K~15-25 on
+    easy images via low-K-tuned attacks; our multi-target σ-zero plateaus
+    at K~40-50. sigma_grind targets that exact regime.
+    """
+    targets = _malt_pick_targets(
+        model=model, clean=clean, true_idx=target_idx,
+        n_candidates=20, n_pick=1,
+    )
+    if not targets:
+        return clean.clone()
+    targeted_batch: list[int | None] = [int(targets[0])]
+    d = clean.numel()
+    init_u_batch = torch.zeros((1, d), device=device)
+    adv_b, _k = _sigma_zero_batched(
+        model=model, clean=clean, target_idx=target_idx,
+        magnitude=1.0 / 255.0, n_iterations=900,
+        init_u_batch=init_u_batch,
+        targeted_idx_batch=targeted_batch,
+        deadline=deadline,
+    )
+    return adv_b if adv_b is not None else clean.clone()
+
+
 def _strategy_jsma_strong(
     model: torch.nn.Module,
     clean: torch.Tensor,
@@ -835,6 +1008,8 @@ _STRATEGIES = {
     "sigma_max": _strategy_sigma_max,
     "sparse_pgd": _strategy_sparse_pgd,
     "sigma_max_malt": _strategy_sigma_max_malt,
+    "sigma_grind": _strategy_sigma_grind,
+    "greedy_fool": _strategy_greedy_fool,
 }
 
 

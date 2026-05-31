@@ -50,6 +50,12 @@ logger = pylogging.getLogger(__name__)
 # is the safe floor with TF32 off. Bump to 0.5 if you still see
 # label_match failures. With TF32 ON, use 1.0+ (noise is larger).
 MIN_MARGIN_LOGITS = float(os.getenv("PERTURB_MIN_MARGIN_LOGITS", "0.3"))
+# Early-ship gate (skips boost entirely on easy already-winning cases). The
+# boost can only INFLATE K, so when the pipeline already produced a strong
+# ship we just sign it off — saves ~2-3s wall and 0.001-0.003 score per
+# easy image (the documented gap to top miners on max_score).
+EARLY_SHIP_MIN_SCORE = float(os.getenv("PERTURB_EARLY_SHIP_MIN_SCORE", "0.95"))
+EARLY_SHIP_MIN_MARGIN = float(os.getenv("PERTURB_EARLY_SHIP_MIN_MARGIN", "0.1"))
 MARGIN_BOOST_MAX_STEPS = int(os.getenv("PERTURB_MARGIN_BOOST_MAX_STEPS", "12"))
 # Pixels touched per boost step — ABSOLUTE count, image-size-independent.
 # Scaling by image dimension (the old `fraction` knob) over-perturbed
@@ -680,6 +686,7 @@ class PerturbMiner:
         best_score = -1.0
         best_result = None
         best_strategy = "?"
+        best_c: typing.Optional[dict] = None
         scored_count = 0
         # Track all evaluated candidates so we can fall back intelligently
         # when nobody flipped under FP32 (avoid shipping clean image).
@@ -698,8 +705,43 @@ class PerturbMiner:
                     best_b64 = c["adv_image_b64"]
                     best_result = r
                     best_strategy = c.get("strategy", "?")
+                    best_c = c
             except Exception as exc:
                 logger.warning(f"score worker result failed: {exc}")
+
+        # Margin-aware safety net: ONLY swap when the best-score candidate's
+        # margin is so catastrophically low that boost can't safely fix it
+        # within the K cap. Boost already handles margin 0.05-0.18 via K
+        # growth (cap 48/96/128 per gap tier) at minimal score cost. Swapping
+        # at margin=0.10 was too aggressive — observed a real case where
+        # sigma_a 0.9497@0.022 → jsma 0.9415@0.376 swap cost 0.008 score
+        # (boost would have rescued sigma_a to ~0.948 with safe margin).
+        # Now: swap only when margin < 0.05 (truly catastrophic) AND the
+        # alternative is essentially the same score (gap ≤ 0.003).
+        DANGER_MARGIN_FLOOR = 0.05
+        SAFE_MARGIN_FLOOR = 0.20
+        SCORE_SWAP_TOLERANCE = 0.003
+        if best_c is not None and float(best_c.get("margin", 0.0)) < DANGER_MARGIN_FLOOR:
+            safe_candidates = [
+                (sc, c, r) for sc, c, r in all_evaluated
+                if float(c.get("margin", 0.0)) >= SAFE_MARGIN_FLOOR and sc > 0.0
+            ]
+            if safe_candidates:
+                safe_candidates.sort(key=lambda t: -t[0])
+                alt_score, alt_c, alt_r = safe_candidates[0]
+                if best_score - alt_score <= SCORE_SWAP_TOLERANCE:
+                    logger.info(
+                        f"margin-safe swap: "
+                        f"{best_strategy} score={best_score:.4f} "
+                        f"margin={float(best_c.get('margin', 0.0)):.3f} → "
+                        f"{alt_c.get('strategy', '?')} score={alt_score:.4f} "
+                        f"margin={float(alt_c.get('margin', 0.0)):.3f}"
+                    )
+                    best_score = alt_score
+                    best_b64 = alt_c["adv_image_b64"]
+                    best_result = alt_r
+                    best_strategy = alt_c.get("strategy", "?")
+                    best_c = alt_c
 
         # When NO worker flipped under FP32 (best_score == 0), the first
         # candidate wins by tie-breaking, but it may have effectively zero
@@ -998,16 +1040,73 @@ class PerturbMiner:
                         dense_shrink_info = f"failed:{type(exc).__name__}"
                         logger.warning(f"dense shrink failed: {exc}")
 
+                # Early-ship gate: if pipeline already produced a strong
+                # ship (score ≥ 0.95 = K<~50 with confident flip), skip the
+                # boost entirely. The boost can only INFLATE K from here —
+                # validator-side stats (avg_rmse=0.000369 for us vs 0.000285
+                # for top miners) show our score gap is ENTIRELY caused by
+                # boost growing K on already-winning easy images. Skip
+                # condition: pipeline_score ≥ 0.95 AND PNG-roundtripped
+                # margin ≥ EARLY_SHIP_MIN_MARGIN (0.1 default — well above
+                # the cross-hardware drift floor we measured earlier).
+                pipeline_score_for_gate = float(
+                    resp.best_result.get("score", 0.0)
+                ) if resp is not None else 0.0
+                skip_boost = False
+                early_margin = None
+                if (
+                    desired_target_idx is not None
+                    and pipeline_score_for_gate >= EARLY_SHIP_MIN_SCORE
+                    and not is_hard_image
+                ):
+                    try:
+                        rt = decode_image_b64(
+                            pipeline_b64_for_boost
+                        ).to(self.device)
+                        with torch.no_grad():
+                            lg = logits_for_images(
+                                model=self.model, image_bchw=rt.unsqueeze(0),
+                            )[0]
+                        masked = lg.clone()
+                        masked[desired_target_idx] = float("-inf")
+                        early_margin = float(
+                            (masked.max() - lg[desired_target_idx]).item()
+                        )
+                        if early_margin >= EARLY_SHIP_MIN_MARGIN:
+                            skip_boost = True
+                    except Exception as exc:
+                        logger.warning(f"early-ship gate margin check failed: {exc}")
+
                 # Margin boost happens under the same lock — it uses the
                 # GPU via the shared model. Pass the hard deadline so
                 # each step bails before we'd cross the validator's 15s
                 # timeout. Reserve 0.3s for encode + return.
-                # On HARD images, boost typically hits its K cap with
-                # margin still negative; raise the cap so it has room
-                # to grow further (we already gave it more time via
-                # reduced worker reserve).
-                if desired_target_idx is not None:
-                    topk_cap_override = 640 if is_hard_image else None
+                #
+                # 3-tier K cap by image difficulty:
+                #   hard (gap > 3): 640 — needs aggressive K to climb out
+                #   easy (gap ≤ 1): 64  — pipeline already flips with K~30,
+                #                         growing to 384 just to push margin
+                #                         from 0.25→0.30 was the documented
+                #                         max_score gap to top miners (uid=1/22
+                #                         ship K=15-20 at rmse=3e-5; we shipped
+                #                         K=256-384 at rmse=1.5e-4)
+                #   mid: default 384 (PERTURB_MARGIN_BOOST_TOPK_PIXELS)
+                if skip_boost:
+                    synapse.perturbed_image_b64 = pipeline_b64_for_boost
+                    margin_info = f"{early_margin:.3f}(early-ship,score={pipeline_score_for_gate:.3f})"
+                elif desired_target_idx is not None:
+                    # Aggressive (rational) 4-tier K caps. Reduced from
+                    # conservative 64/128/192 → 48/96/128 per user direction.
+                    # Hard cap unchanged (640) since hard images genuinely
+                    # need the headroom.
+                    if is_hard_image:
+                        topk_cap_override = 640
+                    elif gap <= 1.0:
+                        topk_cap_override = 48
+                    elif gap <= 2.0:
+                        topk_cap_override = 96
+                    else:
+                        topk_cap_override = 128
                     boosted_b64, margin_info = self._boost_margin_if_low(
                         adv_b64=pipeline_b64_for_boost,
                         clean_b64=synapse.clean_image_b64,
