@@ -934,7 +934,12 @@ class PerturbMiner:
                 # 0.68 → 0.94).
                 pipeline_b64_for_boost = resp.perturbed_image_b64
                 dense_shrink_info = "skipped"
-                if desired_target_idx is not None and time.time() < hard_deadline - 2.5:
+                # Gate reduced 2.5→1.8s to let shrink fire even when 12-worker
+                # dispatch eats 11.7s. Shrink's actual budget is still bounded
+                # by hard_deadline - 1.5 (line below), so it self-limits.
+                # Trade: less boost time when shrink runs, but shrink rescues
+                # more (+0.005-0.020 observed on hard images).
+                if desired_target_idx is not None and time.time() < hard_deadline - 1.8:
                     try:
                         adv_check = decode_image_b64(
                             pipeline_b64_for_boost
@@ -946,9 +951,12 @@ class PerturbMiner:
                             torch.mean((adv_check - clean_check) ** 2)
                         ).item())
                         if rmse_check > DENSE_RMSE_THRESHOLD:
+                            # Tightened from -1.5 → -1.2: gives shrink a touch
+                            # more time on tight cases (boost gets less but
+                            # margin is usually already passable).
                             shrink_dl = min(
                                 time.time() + DENSE_SHRINK_BUDGET_S,
-                                hard_deadline - 1.5,
+                                hard_deadline - 1.2,
                             )
                             shrunk = _shrink_support(
                                 model=self.model,

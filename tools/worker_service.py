@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 
 from perturbnet.attacks import (
     _predict_idx_roundtrip,
+    _rank_targets_by_cost,
     _shrink_support,
     _sigma_zero_batched,
     _sparse_rs_run,
@@ -588,6 +589,198 @@ def _strategy_sigma_max(
     return adv_b if adv_b is not None else clean.clone()
 
 
+def _malt_pick_targets(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    true_idx: int,
+    n_candidates: int,
+    n_pick: int,
+) -> list[int]:
+    """MALT-style target picker (Lim et al. 2024, arXiv:2407.02240).
+
+    Re-ranks the top-`n_candidates` runner-up classes by Jacobian-normalized
+    attack cost `gap / ||∇_x(logit[true]−logit[r])||_∞` (cheapest = most
+    L∞-efficient flip target), then returns the `n_pick` cheapest. MALT's
+    central finding: the optimal sparse-attack target is *often not* the
+    runner-up — sometimes ranked 18th or 52nd in raw logits. Using cost
+    ranking instead of logit ranking is the entire `MALT` contribution.
+
+    Cost: ~`n_candidates` backward passes (~35ms each under MPS) — the
+    caller's deadline must accommodate this pre-stage.
+    """
+    ranked = _rank_targets_by_cost(
+        model=model, clean=clean, true_idx=true_idx, num_candidates=n_candidates,
+    )
+    if not ranked:
+        return _top_runner_ups(
+            model=model, clean=clean, true_idx=true_idx, n=n_pick,
+        )
+    return ranked[:n_pick]
+
+
+def _strategy_sparse_pgd(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """Sparse-PGD (Zhong et al. 2024, arXiv:2405.05075) — explicit binary
+    mask + sign-only magnitude formulation, with random mask re-init on
+    stagnation to escape σ-zero's soft-L0 local minima.
+
+    Pre-stage: MALT target picking (top-2 cheapest from top-20 candidates).
+    Pipeline: for each target × each K in [1024, 512, 256], run ~15 PGD
+    iters with mask fixed, sign updated by descent gradient. After
+    `patience` iters of no margin improvement, randomly mix mask (half
+    grad-top-K, half random positions with random signs).
+
+    Why this helps on the 0.9043 floor: σ-zero's soft mask can get stuck
+    in basins for high-confidence images. The random restart lets Sparse-PGD
+    try qualitatively different pixel subsets, which sometimes finds flips
+    σ-zero misses entirely (the 0.0000 ship cases).
+    """
+    magnitude = 1.0 / 255.0
+    d = clean.numel()
+
+    targets = _malt_pick_targets(
+        model=model, clean=clean, true_idx=target_idx,
+        n_candidates=20, n_pick=2,
+    )
+    if not targets:
+        return clean.clone()
+
+    best_adv = clean.clone()
+    best_k = d + 1
+
+    K_schedule = (1024, 512, 256)
+    n_pgd_per_K = 15
+    patience = 5
+
+    for target_t in targets:
+        if time.time() >= deadline:
+            break
+        rng = torch.Generator(device=device).manual_seed(7 + int(target_t))
+
+        # Initial single-step gradient at clean — picks the seed top-K mask.
+        adv_g = clean.detach().requires_grad_(True)
+        logits = logits_for_images(model=model, image_bchw=adv_g.unsqueeze(0))[0]
+        margin = logits[target_idx] - logits[target_t]
+        try:
+            grad_clean = torch.autograd.grad(margin, adv_g)[0].detach().view(-1)
+        except Exception as exc:
+            logger.warning(f"sparse_pgd init grad failed for target {target_t}: {exc}")
+            continue
+
+        for K_attempt in K_schedule:
+            if time.time() >= deadline:
+                break
+
+            _, top_idx = grad_clean.abs().topk(K_attempt)
+            mask = torch.zeros(d, device=device)
+            mask[top_idx] = 1.0
+            sign = -grad_clean.sign()
+
+            best_margin_K = float("inf")
+            stagnant = 0
+
+            for it in range(n_pgd_per_K):
+                if time.time() >= deadline:
+                    break
+
+                quant_delta = magnitude * sign * mask
+                adv_q_flat = (clean.view(-1) + quant_delta).clamp(0.0, 1.0)
+                adv_q = adv_q_flat.view_as(clean)
+
+                # Forward+backward for next step.
+                adv_g = adv_q.detach().requires_grad_(True)
+                logits = logits_for_images(model=model, image_bchw=adv_g.unsqueeze(0))[0]
+                margin = logits[target_idx] - logits[target_t]
+                cur_margin = float(margin.item())
+                try:
+                    grad = torch.autograd.grad(margin, adv_g)[0].detach().view(-1)
+                except Exception as exc:
+                    logger.warning(f"sparse_pgd grad failed: {exc}")
+                    break
+
+                if cur_margin < 0:
+                    k = int((quant_delta != 0).sum().item())
+                    if k < best_k:
+                        if _predict_idx_roundtrip(model, adv_q) != target_idx:
+                            best_k = k
+                            best_adv = adv_q.detach().clone()
+
+                if cur_margin < best_margin_K - 1e-4:
+                    best_margin_K = cur_margin
+                    stagnant = 0
+                else:
+                    stagnant += 1
+
+                # Sign update on masked positions (descent).
+                sign = torch.where(mask > 0, -grad.sign(), sign)
+
+                if stagnant >= patience and it < n_pgd_per_K - 1:
+                    k_keep = K_attempt // 2
+                    _, gt_idx = grad.abs().topk(k_keep)
+                    grad_mask = torch.zeros(d, device=device)
+                    grad_mask[gt_idx] = 1.0
+                    perm = torch.randperm(d, generator=rng, device=device)
+                    new_mask = grad_mask.clone()
+                    new_mask[perm[: K_attempt - k_keep]] = 1.0
+                    rand_sign = (
+                        torch.randint(0, 2, (d,), generator=rng, device=device).float()
+                        * 2.0 - 1.0
+                    )
+                    # Gradient-aligned sign on the grad-kept half, random
+                    # sign on the freshly-injected random half.
+                    sign = torch.where(grad_mask > 0, -grad.sign(), rand_sign)
+                    mask = (new_mask > 0).float()
+                    stagnant = 0
+                    best_margin_K = float("inf")
+
+    return best_adv
+
+
+def _strategy_sigma_max_malt(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """σ-zero zeros-init, B=12, n_iter=300 — but with MALT target picking
+    instead of raw runner-up ordering.
+
+    Identical to sigma_max except the 11 targeted rows aim at the MALT
+    top-11 cheapest classes (Jacobian-normalized cost) from a top-30
+    candidate pool. The paper's claim: optimal targets are often ranked
+    18-52 by logits but rank-1 by attack cost. If true on our images,
+    sigma_max_malt should find lower-K flips than sigma_max on hard cases.
+
+    Pre-stage adds ~1s (30 backward passes); compensated by n_iter=240
+    instead of 300.
+    """
+    targets = _malt_pick_targets(
+        model=model, clean=clean, true_idx=target_idx,
+        n_candidates=30, n_pick=11,
+    )
+    if not targets:
+        return clean.clone()
+    targeted_batch: list[int | None] = [None]
+    targeted_batch.extend(int(t) for t in targets)
+    B = len(targeted_batch)
+    d = clean.numel()
+    init_u_batch = torch.zeros((B, d), device=device)
+    adv_b, _k = _sigma_zero_batched(
+        model=model, clean=clean, target_idx=target_idx,
+        magnitude=1.0 / 255.0, n_iterations=240,
+        init_u_batch=init_u_batch,
+        targeted_idx_batch=targeted_batch,
+        deadline=deadline,
+    )
+    return adv_b if adv_b is not None else clean.clone()
+
+
 def _strategy_jsma_strong(
     model: torch.nn.Module,
     clean: torch.Tensor,
@@ -640,6 +833,8 @@ _STRATEGIES = {
     "sigma_hard_b": _strategy_sigma_hard_b,
     "jsma_strong": _strategy_jsma_strong,
     "sigma_max": _strategy_sigma_max,
+    "sparse_pgd": _strategy_sparse_pgd,
+    "sigma_max_malt": _strategy_sigma_max_malt,
 }
 
 
