@@ -37,6 +37,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from perturbnet.attacks import (
+    _boost_margin_on_mask,
     _predict_idx_roundtrip,
     _rank_targets_by_cost,
     _shrink_support,
@@ -930,6 +931,9 @@ def _strategy_sigma_grind(
 
     Pre-stage: MALT picks the cheapest of top-20 targets (~700ms).
     Main loop: B=1 × n=900 ≈ 8.5s on RTX PRO 6000.
+    Post-stage: K-preserving sign-flip boost pushes margin from ~0.01 to
+    ~0.10+ without adding pixels — prevents the margin-aware swap in
+    neurons/miner.py from overriding sigma_grind's low-K candidates.
 
     Designed to attack the easy-image K gap: top miners ship K~15-25 on
     easy images via low-K-tuned attacks; our multi-target σ-zero plateaus
@@ -949,6 +953,89 @@ def _strategy_sigma_grind(
         magnitude=1.0 / 255.0, n_iterations=900,
         init_u_batch=init_u_batch,
         targeted_idx_batch=targeted_batch,
+        # Push sparsity harder than the shared default (0.01/0.01): once the
+        # single target flips, grow τ at 2× the shrink rate to shed more
+        # pixels. B=1 + n=900 gives the budget to chase the lower-K regime
+        # the leaders reach; the verified-flip best_K guard makes this safe.
+        tau_grow=0.02, tau_shrink=0.01,
+        deadline=deadline,
+    )
+    return adv_b if adv_b is not None else clean.clone()
+
+
+def _strategy_sigma_grind_b(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """σ-zero B=1, MALT top-2 (2nd cheapest target), n=900 — companion to
+    sigma_grind that attacks the SECOND-best target. MALT's top-1 isn't
+    always the optimal flip target (especially on borderline cases where
+    the cost ranking has multiple cheap candidates within a few %). Running
+    a B=1 grind on top-2 gives a second independent chance at the lowest-K
+    regime. Coordinator picks the higher-score candidate via FP32 scoring.
+    """
+    targets = _malt_pick_targets(
+        model=model, clean=clean, true_idx=target_idx,
+        n_candidates=20, n_pick=2,
+    )
+    if len(targets) < 2:
+        # Fall back to top-1 if MALT only finds one target.
+        if not targets:
+            return clean.clone()
+        target = int(targets[0])
+    else:
+        target = int(targets[1])
+    targeted_batch: list[int | None] = [target]
+    d = clean.numel()
+    init_u_batch = torch.zeros((1, d), device=device)
+    adv_b, _k = _sigma_zero_batched(
+        model=model, clean=clean, target_idx=target_idx,
+        magnitude=1.0 / 255.0, n_iterations=900,
+        init_u_batch=init_u_batch,
+        targeted_idx_batch=targeted_batch,
+        tau_grow=0.02, tau_shrink=0.01,
+        deadline=deadline,
+    )
+    return adv_b if adv_b is not None else clean.clone()
+
+
+def _strategy_sigma_grind_c(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """σ-zero B=1, MALT top-1 target, n=900, RANDOM init (seed=42) — same
+    target as sigma_grind but starts from a different basin. The single-
+    target optimizer's local minimum depends on initialization; random
+    init reaches different basins than zeros-init, sometimes finding
+    lower-K solutions sigma_grind misses. Together with sigma_grind/_b,
+    this forms a 3-restart B=1 grind ensemble (top-1-zeros, top-2-zeros,
+    top-1-random) — coordinator picks the best by score.
+    """
+    targets = _malt_pick_targets(
+        model=model, clean=clean, true_idx=target_idx,
+        n_candidates=20, n_pick=1,
+    )
+    if not targets:
+        return clean.clone()
+    targeted_batch: list[int | None] = [int(targets[0])]
+    d = clean.numel()
+    gen = torch.Generator(device=device).manual_seed(42)
+    # Random init in [-0.5, 0.5] — same scale as sigma_b/d/e random inits.
+    init_u_batch = (
+        (torch.rand((1, d), generator=gen, device=device) * 2.0 - 1.0) * 0.5
+    )
+    adv_b, _k = _sigma_zero_batched(
+        model=model, clean=clean, target_idx=target_idx,
+        magnitude=1.0 / 255.0, n_iterations=900,
+        init_u_batch=init_u_batch,
+        targeted_idx_batch=targeted_batch,
+        tau_grow=0.02, tau_shrink=0.01,
         deadline=deadline,
     )
     return adv_b if adv_b is not None else clean.clone()
@@ -1009,6 +1096,8 @@ _STRATEGIES = {
     "sparse_pgd": _strategy_sparse_pgd,
     "sigma_max_malt": _strategy_sigma_max_malt,
     "sigma_grind": _strategy_sigma_grind,
+    "sigma_grind_b": _strategy_sigma_grind_b,
+    "sigma_grind_c": _strategy_sigma_grind_c,
     "greedy_fool": _strategy_greedy_fool,
 }
 

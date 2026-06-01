@@ -79,14 +79,20 @@ MARGIN_BOOST_STEP_SIZE = 1.0 / 255.0
 #  - Hard images: hit the cap by step 4-5 anyway, same total cost as
 #    fixed K=256, just with slightly different pixel selection over the
 #    earlier (small-K) steps.
-# Growth factor is configurable; 2.0 (doubling) hits the cap in
-# log2(256/32) = 3 steps. Higher growth converges faster on hard
-# images, lower growth is more RMSE-efficient on borderline cases.
+# Growth factor is configurable; finer granularity is more RMSE-efficient
+# because the boost ACCUMULATES pixels and stops the instant margin crosses
+# MIN_MARGIN_LOGITS — so committing fewer pixels per step lets it stop with
+# a smaller total K (lower RMSE) instead of overshooting the pixel count in
+# one coarse step. We start at 16 (was 32) and grow ×1.5 (was ×2.0): on the
+# borderline cases that actually trigger the boost this lands the 0.3-margin
+# gate with materially fewer added pixels. Cost is a few extra ~150ms steps,
+# bounded by MARGIN_BOOST_MAX_STEPS and the hard deadline. Hard images still
+# reach the cap within budget (16·1.5^9 ≈ 615 > 384 cap by step 9).
 MARGIN_BOOST_TOPK_INITIAL = int(
-    os.getenv("PERTURB_MARGIN_BOOST_TOPK_INITIAL", "32")
+    os.getenv("PERTURB_MARGIN_BOOST_TOPK_INITIAL", "16")
 )
 MARGIN_BOOST_TOPK_GROWTH = float(
-    os.getenv("PERTURB_MARGIN_BOOST_TOPK_GROWTH", "2.0")
+    os.getenv("PERTURB_MARGIN_BOOST_TOPK_GROWTH", "1.5")
 )
 # Cap the boost's L∞ budget at exactly the σ-zero magnitude (1/255). Two
 # reasons: (1) every pixel value is already a clean multiple of 1/255 after

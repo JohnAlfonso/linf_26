@@ -910,6 +910,8 @@ def _sigma_zero_batched(
     sigma: float = 1e-3,
     eta0: float = 1.0,
     tau0: float = 0.3,
+    tau_grow: float = 0.01,
+    tau_shrink: float = 0.01,
     deadline: float | None = None,
 ) -> tuple[torch.Tensor | None, int]:
     """Batched σ-zero: runs `B = init_u_batch.shape[0]` independent attacks in
@@ -995,12 +997,18 @@ def _sigma_zero_batched(
         eta = float(eta0) * (1.0 + math.cos(math.pi * i / max(1, n_iterations))) / 2.0
 
         # Per-row τ update: grow when row flipped (sparser), shrink when not.
+        # Asymmetric rates (tau_grow > tau_shrink) bias toward sparser flips:
+        # once a row flips, push the threshold up harder to shed more pixels.
+        # This is safe for K — best_adv only adopts a sparser candidate that
+        # is verified to STILL flip post-roundtrip (below), so over-eager
+        # sparsification can never ship a non-flipping result; it just lets
+        # tau oscillate tighter around the flip boundary where min-K lives.
         with torch.no_grad():
             flipped_rows = (margins_t < 0.0)
             tau_delta = torch.where(
                 flipped_rows,
-                torch.full_like(tau, 0.01 * eta),
-                torch.full_like(tau, -0.01 * eta),
+                torch.full_like(tau, tau_grow * eta),
+                torch.full_like(tau, -tau_shrink * eta),
             )
             tau = (tau + tau_delta).clamp(0.0, 1.0)
 
