@@ -973,6 +973,39 @@ class PerturbMiner:
                         _pps_module.predict_index = orig_predict_index
                         _PER_REQUEST_SIGMA.clear()
 
+                # ── Emergency rescue: all-workers-failed case ───────────
+                # If every worker returned a non-flipping candidate
+                # (pipeline_score=0), dense_shrink and boost cannot recover
+                # — they need a flipping starting point. Instead, run ONE
+                # focused high-K untargeted PGD with all remaining budget.
+                # On extreme hard images (gap > 5), this can occasionally
+                # flip what σ-zero family couldn't. If it succeeds → ship
+                # that. If it fails → continue with existing pipeline (still
+                # 0 score, no worse than before).
+                pipeline_score_check = float(
+                    resp.best_result.get("score", 0.0)
+                ) if resp is not None else 0.0
+                rescue_info = "skipped"
+                if (
+                    pipeline_score_check == 0.0
+                    and desired_target_idx is not None
+                    and time.time() < hard_deadline - 2.5
+                ):
+                    try:
+                        rescued_b64 = self._emergency_rescue(
+                            clean_b64=synapse.clean_image_b64,
+                            true_idx=desired_target_idx,
+                            deadline=hard_deadline - 1.5,
+                        )
+                        if rescued_b64 is not None:
+                            resp.perturbed_image_b64 = rescued_b64
+                            rescue_info = "flipped"
+                        else:
+                            rescue_info = "failed"
+                    except Exception as exc:
+                        rescue_info = f"err:{type(exc).__name__}"
+                        logger.warning(f"emergency rescue failed: {exc}")
+
                 # Pre-boost: if the pipeline returned a dense result
                 # (rmse > DENSE_RMSE_THRESHOLD), it almost certainly came
                 # from the pipeline's PGD fallback after σ-zero failed.
@@ -1228,6 +1261,7 @@ class PerturbMiner:
                 f"task={task_id} pipeline_score={pipeline_score:.4f} "
                 f"shipped_score={shipped_score:.4f} shipped_reason={shipped_reason} "
                 f"pipeline_reason={reason} margin={margin_info} "
+                f"rescue={locals().get('rescue_info', 'na')} "
                 f"dense_shrink={dense_shrink_info} linf_proj={projection_info} "
                 f"phase_e={phase_e_info} elapsed={elapsed_ms}ms"
             )
@@ -1293,6 +1327,94 @@ class PerturbMiner:
                 logger.warning(f"save_result submit failed: {exc}")
 
         return synapse
+
+    def _emergency_rescue(
+        self,
+        clean_b64: str,
+        true_idx: int,
+        deadline: float,
+    ) -> str | None:
+        """Last-resort attack when all workers failed to flip.
+
+        Triggered when pipeline_score == 0 (no candidate flipped the model
+        even in FP32-strict scoring). Runs ONE focused high-K untargeted
+        PGD with all remaining budget — different config from the workers
+        (which are all K-minimizing). On extreme hard images (gap > 5),
+        this occasionally finds a flip the K-minimizing strategies miss.
+
+        K is scaled by the clean-image confidence gap (gap × 3000, clamped
+        to [3000, 25000]). Mask resamples every 20 iters. Returns b64 of
+        flipping candidate (PNG-roundtrip verified) or None if no flip
+        found before deadline.
+        """
+        clean = decode_image_b64(clean_b64).to(self.device)
+        d = clean.numel()
+        magnitude = 1.0 / 255.0
+        clean_flat = clean.view(-1)
+
+        # Determine K from confidence gap
+        with torch.no_grad():
+            lg_clean = logits_for_images(
+                model=self.model, image_bchw=clean.unsqueeze(0),
+            )[0]
+            top2 = lg_clean.topk(2)
+            gap = float((top2.values[0] - top2.values[1]).item())
+        K = max(3000, min(25000, int(gap * 3000)))
+        K = min(K, d - 1)
+
+        # Init mask from grad of logit[true_idx] (untargeted: minimize true logit)
+        adv_g = clean.detach().requires_grad_(True)
+        lg = logits_for_images(model=self.model, image_bchw=adv_g.unsqueeze(0))[0]
+        try:
+            grad = torch.autograd.grad(lg[true_idx], adv_g)[0].detach().view(-1)
+        except Exception:
+            return None
+        _, top_idx = grad.abs().topk(K)
+        mask = torch.zeros(d, device=self.device)
+        mask[top_idx] = 1.0
+        sign = -grad.sign()  # descent direction for true_logit
+
+        best_flipping_adv: torch.Tensor | None = None
+        n_iters = 100
+        for it in range(n_iters):
+            if time.time() >= deadline - 0.4:
+                break
+            delta = magnitude * sign * mask
+            adv_flat = (clean_flat + delta).clamp(0.0, 1.0)
+            adv = adv_flat.view_as(clean)
+
+            # Check PNG-roundtrip flip every 10 iters (expensive)
+            if it % 10 == 0 or it == n_iters - 1:
+                adv_cpu = adv.detach().cpu()
+                adv_b64 = encode_image_b64(adv_cpu)
+                rt = decode_image_b64(adv_b64).to(self.device)
+                with torch.no_grad():
+                    rt_pred = int(
+                        logits_for_images(
+                            model=self.model, image_bchw=rt.unsqueeze(0),
+                        )[0].argmax().item()
+                    )
+                if rt_pred != true_idx:
+                    # Found a flip — return immediately
+                    return adv_b64
+
+            adv_g = adv.detach().requires_grad_(True)
+            lg = logits_for_images(model=self.model, image_bchw=adv_g.unsqueeze(0))[0]
+            try:
+                grad = torch.autograd.grad(lg[true_idx], adv_g)[0].detach().view(-1)
+            except Exception:
+                break
+
+            # Resample mask every 20 iters
+            if it > 0 and it % 20 == 0:
+                _, top_idx = grad.abs().topk(K)
+                mask = torch.zeros(d, device=self.device)
+                mask[top_idx] = 1.0
+                sign = -grad.sign()
+            else:
+                sign = torch.where(mask > 0, -grad.sign(), sign)
+
+        return None
 
     def _boost_margin_if_low(
         self,

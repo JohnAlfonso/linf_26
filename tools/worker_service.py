@@ -1041,6 +1041,105 @@ def _strategy_sigma_grind_c(
     return adv_b if adv_b is not None else clean.clone()
 
 
+def _strategy_pgd_high_k(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    target_idx: int,
+    device: torch.device,
+    deadline: float,
+) -> torch.Tensor:
+    """Guaranteed-flip strategy: PGD with K scaled to image difficulty.
+
+    K is set ADAPTIVELY from the clean-image confidence gap:
+        K = clip(gap * 3000, 200, 20000)
+    Easy images (gap=0.5) → K=200 (won't compete with sigma_a's K=30)
+    Mid images (gap=2) → K=6000
+    Hard images (gap=5) → K=15000
+    Extreme (gap=7) → K=20000 (matches top miners on the 8308101 case)
+
+    Validator log analysis: on the strawberry task (gap=6.99), top miners
+    shipped K=19,860 pixels (uid=1) for score 0.932, while our σ-zero
+    family failed entirely (all candidates non-flipping). The K=150 in the
+    earlier version of this strategy was wildly undersized — per-pixel
+    impact at L∞=1/255 is too small to flip a 7-logit confidence gap with
+    only 150 pixels; need 20K+.
+
+    Score impact: at K=20K with rmse=0.001 and eps=0.169 (typical hard-
+    image eps), validator score ≈ 0.93. Won't win easy images (much
+    higher K than competitors there), but rescues the 0.0 ships that
+    have been the biggest score drag on hard images.
+    """
+    magnitude = 1.0 / 255.0
+    d = clean.numel()
+
+    targets = _malt_pick_targets(
+        model=model, clean=clean, true_idx=target_idx,
+        n_candidates=20, n_pick=1,
+    )
+    if not targets:
+        return clean.clone()
+    target_t = int(targets[0])
+
+    clean_flat = clean.view(-1)
+
+    # Initial mask: top-K by gradient at clean — K scaled by gap.
+    adv_g = clean.detach().requires_grad_(True)
+    logits = logits_for_images(model=model, image_bchw=adv_g.unsqueeze(0))[0]
+    # Compute confidence gap to scale K
+    top2 = logits.topk(2)
+    gap = float((top2.values[0] - top2.values[1]).item())
+    K = max(200, min(20000, int(gap * 3000)))
+    K = min(K, d - 1)  # safety: never exceed total pixel count
+
+    margin = logits[target_idx] - logits[target_t]
+    try:
+        grad = torch.autograd.grad(margin, adv_g)[0].detach().view(-1)
+    except Exception as exc:
+        logger.warning(f"pgd_high_k init grad failed: {exc}")
+        return clean.clone()
+
+    _, top_idx = grad.abs().topk(K)
+    mask = torch.zeros(d, device=device)
+    mask[top_idx] = 1.0
+    sign = -grad.sign()
+
+    best_adv: torch.Tensor | None = None
+    best_margin = float("inf")
+    n_iters = 60
+
+    for it in range(n_iters):
+        if time.time() >= deadline - 0.5:
+            break
+        delta = magnitude * sign * mask
+        adv_flat = (clean_flat + delta).clamp(0.0, 1.0)
+        adv = adv_flat.view_as(clean)
+
+        adv_g = adv.detach().requires_grad_(True)
+        logits = logits_for_images(model=model, image_bchw=adv_g.unsqueeze(0))[0]
+        cur_margin = logits[target_idx] - logits[target_t]
+        cur_m = float(cur_margin.item())
+
+        if cur_m < best_margin:
+            best_margin = cur_m
+            if cur_m < 0:
+                if _predict_idx_roundtrip(model, adv) != target_idx:
+                    best_adv = adv.detach().clone()
+                    if cur_m < -1.0:
+                        return best_adv
+            else:
+                if best_adv is None:
+                    best_adv = adv.detach().clone()
+
+        try:
+            grad = torch.autograd.grad(cur_margin, adv_g)[0].detach().view(-1)
+        except Exception as exc:
+            logger.warning(f"pgd_high_k grad failed at iter {it}: {exc}")
+            break
+        sign = torch.where(mask > 0, -grad.sign(), sign)
+
+    return best_adv if best_adv is not None else clean.clone()
+
+
 def _strategy_jsma_strong(
     model: torch.nn.Module,
     clean: torch.Tensor,
@@ -1099,6 +1198,7 @@ _STRATEGIES = {
     "sigma_grind_b": _strategy_sigma_grind_b,
     "sigma_grind_c": _strategy_sigma_grind_c,
     "greedy_fool": _strategy_greedy_fool,
+    "pgd_high_k": _strategy_pgd_high_k,
 }
 
 
